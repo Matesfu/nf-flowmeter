@@ -910,40 +910,40 @@ event tcp_rexmit(c: connection, is_orig: bool, seq: count,
 # ICMP events (NF-v3: ICMP_TYPE, ICMP_IPV4_TYPE)
 # =============================================================================
 
-event icmp_sent(c: connection, icmp: icmp_info)
+event icmp_sent(c: connection, info: icmp_info)
     {
     local uid = c$uid;
     if ( uid !in icmp_cache )
         icmp_cache[uid] = ICMP_Features();
     # ICMP type is encoded in the "port" fields by Zeek
     # id.orig_p = ICMP type, id.resp_p = ICMP code
-    icmp_cache[uid]$icmp_type = icmp$itype;
+    icmp_cache[uid]$icmp_type = info$itype;
     }
 
-event icmp_unreachable(c: connection, icmp: icmp_info,
+event icmp_unreachable(c: connection, info: icmp_info,
                         code: count, context: icmp_context)
     {
     local uid = c$uid;
     if ( uid !in icmp_cache )
         icmp_cache[uid] = ICMP_Features();
     icmp_cache[uid]$icmp_type = 3;  # ICMP type 3 = Destination Unreachable
-    # context$ip holds the original IP header that triggered the ICMP error
-    if ( context?$ip_hdr )
-        icmp_cache[uid]$icmp_ipv4_type = context$ip_hdr$p;
+    # context holds the original IP header that triggered the ICMP error
+    if ( ! context$bad_hdr_len )
+        icmp_cache[uid]$icmp_ipv4_type = context$proto;
     }
 
-event icmp_time_exceeded(c: connection, icmp: icmp_info,
+event icmp_time_exceeded(c: connection, info: icmp_info,
                           code: count, context: icmp_context)
     {
     local uid = c$uid;
     if ( uid !in icmp_cache )
         icmp_cache[uid] = ICMP_Features();
     icmp_cache[uid]$icmp_type = 11;  # ICMP type 11 = Time Exceeded
-    if ( context?$ip_hdr )
-        icmp_cache[uid]$icmp_ipv4_type = context$ip_hdr$p;
+    if ( ! context$bad_hdr_len )
+        icmp_cache[uid]$icmp_ipv4_type = context$proto;
     }
 
-event icmp_echo_request(c: connection, icmp: icmp_info,
+event icmp_echo_request(c: connection, info: icmp_info,
                          id: count, seq: count, payload: string)
     {
     local uid = c$uid;
@@ -952,7 +952,7 @@ event icmp_echo_request(c: connection, icmp: icmp_info,
     icmp_cache[uid]$icmp_type = 8;  # ICMP type 8 = Echo Request
     }
 
-event icmp_echo_reply(c: connection, icmp: icmp_info,
+event icmp_echo_reply(c: connection, info: icmp_info,
                        id: count, seq: count, payload: string)
     {
     local uid = c$uid;
@@ -1109,7 +1109,7 @@ event connection_state_remove(c: connection) &priority=-5
 
     local all_payloads: vector of count = vector();
     for ( i in payload_fwd[uid] ) all_payloads += vector(payload_fwd[uid][i]);
-    for ( i in payload_bwd[uid] ) all_payloads += vector(payload_bwd[uid][i]);
+    for ( i2 in payload_bwd[uid] ) all_payloads += vector(payload_bwd[uid][i2]);
     local flow_payload_stats = generate_stats_count(all_payloads);
 
     # ── Header statistics ────────────────────────────────────────────────────
@@ -1164,19 +1164,20 @@ event connection_state_remove(c: connection) &priority=-5
     local bwd_bulk_pkt_avg:   double = 0.0;
     local bwd_bulk_rate_avg:  double = 0.0;
 
-    local n_fwd_bulk = |bulk_fwd_results[uid]| / 3;
+    local fwd_bulk_vec = bulk_fwd_results[uid];
+    local n_fwd_bulk = |fwd_bulk_vec| / 3;
     if ( n_fwd_bulk > 0 )
         {
         local total_fwd_bulk_bytes:  double = 0.0;
         local total_fwd_bulk_pkts:   double = 0.0;
         local total_fwd_bulk_dur:    double = 0.0;
-        local fi = 0;
-        while ( fi < |bulk_fwd_results[uid]| )
+        local k: count = 0;
+        while ( k < |fwd_bulk_vec| )
             {
-            total_fwd_bulk_bytes += bulk_fwd_results[uid][fi];
-            total_fwd_bulk_pkts  += bulk_fwd_results[uid][fi+1];
-            total_fwd_bulk_dur   += bulk_fwd_results[uid][fi+2];
-            fi += 3;
+            total_fwd_bulk_bytes += fwd_bulk_vec[k];
+            total_fwd_bulk_pkts  += fwd_bulk_vec[k+1];
+            total_fwd_bulk_dur   += fwd_bulk_vec[k+2];
+            k += 3;
             }
         fwd_bulk_byte_avg = total_fwd_bulk_bytes / n_fwd_bulk;
         fwd_bulk_pkt_avg  = total_fwd_bulk_pkts  / n_fwd_bulk;
@@ -1184,18 +1185,19 @@ event connection_state_remove(c: connection) &priority=-5
             fwd_bulk_rate_avg = total_fwd_bulk_bytes / total_fwd_bulk_dur;
         }
 
-    local n_bwd_bulk = |bulk_bwd_results[uid]| / 3;
+    local bwd_bulk_vec = bulk_bwd_results[uid];
+    local n_bwd_bulk = |bwd_bulk_vec| / 3;
     if ( n_bwd_bulk > 0 )
         {
         local total_bwd_bulk_bytes:  double = 0.0;
         local total_bwd_bulk_pkts:   double = 0.0;
         local total_bwd_bulk_dur:    double = 0.0;
-        local j = 0;
-        while ( j < |bulk_bwd_results[uid]| )
+        local j: count = 0;
+        while ( j < |bwd_bulk_vec| )
             {
-            total_bwd_bulk_bytes += bulk_bwd_results[uid][j];
-            total_bwd_bulk_pkts  += bulk_bwd_results[uid][j+1];
-            total_bwd_bulk_dur   += bulk_bwd_results[uid][j+2];
+            total_bwd_bulk_bytes += bwd_bulk_vec[j];
+            total_bwd_bulk_pkts  += bwd_bulk_vec[j+1];
+            total_bwd_bulk_dur   += bwd_bulk_vec[j+2];
             j += 3;
             }
         bwd_bulk_byte_avg = total_bwd_bulk_bytes / n_bwd_bulk;
@@ -1278,8 +1280,8 @@ event connection_state_remove(c: connection) &priority=-5
         icmp_ipv4_type = icmp_cache[uid]$icmp_ipv4_type;
         }
     # For ICMP flows, Zeek encodes type in id.orig_p
-    else if ( c$conn?$proto && c$conn$proto == "icmp" )
-        icmp_type = count_of(c$id$orig_p);
+    else if ( c$conn?$proto && c$conn$proto == icmp )
+        icmp_type = port_to_count(c$id$orig_p);
 
     # ── Min/Max TTL safety check (if no IP packets seen, reset to 0) ─────────
     local min_ttl_val: count = 0;
