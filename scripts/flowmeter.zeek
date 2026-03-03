@@ -600,7 +600,7 @@ event new_connection(c: connection)
 # Per-packet processing — core of all new NF-v3 features
 # =============================================================================
 
-event new_packet(c: connection, p: pkt_hdr, len: count) &priority=5
+event new_packet(c: connection, p: pkt_hdr) &priority=5
     {
     local uid = c$uid;
 
@@ -910,7 +910,7 @@ event tcp_rexmit(c: connection, is_orig: bool, seq: count,
 # ICMP events (NF-v3: ICMP_TYPE, ICMP_IPV4_TYPE)
 # =============================================================================
 
-event icmp_sent(c: connection, icmp: icmp_conn)
+event icmp_sent(c: connection, icmp: icmp_info)
     {
     local uid = c$uid;
     if ( uid !in icmp_cache )
@@ -920,7 +920,7 @@ event icmp_sent(c: connection, icmp: icmp_conn)
     icmp_cache[uid]$icmp_type = icmp$itype;
     }
 
-event icmp_unreachable(c: connection, icmp: icmp_conn,
+event icmp_unreachable(c: connection, icmp: icmp_info,
                         code: count, context: icmp_context)
     {
     local uid = c$uid;
@@ -928,22 +928,22 @@ event icmp_unreachable(c: connection, icmp: icmp_conn,
         icmp_cache[uid] = ICMP_Features();
     icmp_cache[uid]$icmp_type = 3;  # ICMP type 3 = Destination Unreachable
     # context$ip holds the original IP header that triggered the ICMP error
-    if ( context?$ip )
-        icmp_cache[uid]$icmp_ipv4_type = context$ip$p;
+    if ( context?$ip_hdr )
+        icmp_cache[uid]$icmp_ipv4_type = context$ip_hdr$p;
     }
 
-event icmp_time_exceeded(c: connection, icmp: icmp_conn,
+event icmp_time_exceeded(c: connection, icmp: icmp_info,
                           code: count, context: icmp_context)
     {
     local uid = c$uid;
     if ( uid !in icmp_cache )
         icmp_cache[uid] = ICMP_Features();
     icmp_cache[uid]$icmp_type = 11;  # ICMP type 11 = Time Exceeded
-    if ( context?$ip )
-        icmp_cache[uid]$icmp_ipv4_type = context$ip$p;
+    if ( context?$ip_hdr )
+        icmp_cache[uid]$icmp_ipv4_type = context$ip_hdr$p;
     }
 
-event icmp_echo_request(c: connection, icmp: icmp_conn,
+event icmp_echo_request(c: connection, icmp: icmp_info,
                          id: count, seq: count, payload: string)
     {
     local uid = c$uid;
@@ -952,7 +952,7 @@ event icmp_echo_request(c: connection, icmp: icmp_conn,
     icmp_cache[uid]$icmp_type = 8;  # ICMP type 8 = Echo Request
     }
 
-event icmp_echo_reply(c: connection, icmp: icmp_conn,
+event icmp_echo_reply(c: connection, icmp: icmp_info,
                        id: count, seq: count, payload: string)
     {
     local uid = c$uid;
@@ -980,7 +980,7 @@ event dns_A_reply(c: connection, msg: dns_msg, ans: dns_answer, a: addr)
     {
     local uid = c$uid;
     if ( uid !in dns_cache ) dns_cache[uid] = DNS_Features();
-    dns_cache[uid]$ttl_answer    = ans$TTL;
+    dns_cache[uid]$ttl_answer    = double_to_count(interval_to_double(ans$TTL));
     dns_cache[uid]$response_code = msg$rcode;
     }
 
@@ -988,7 +988,7 @@ event dns_AAAA_reply(c: connection, msg: dns_msg, ans: dns_answer, a: addr)
     {
     local uid = c$uid;
     if ( uid !in dns_cache ) dns_cache[uid] = DNS_Features();
-    dns_cache[uid]$ttl_answer    = ans$TTL;
+    dns_cache[uid]$ttl_answer    = double_to_count(interval_to_double(ans$TTL));
     dns_cache[uid]$response_code = msg$rcode;
     }
 
@@ -997,7 +997,7 @@ event dns_MX_reply(c: connection, msg: dns_msg, ans: dns_answer,
     {
     local uid = c$uid;
     if ( uid !in dns_cache ) dns_cache[uid] = DNS_Features();
-    dns_cache[uid]$ttl_answer    = ans$TTL;
+    dns_cache[uid]$ttl_answer    = double_to_count(interval_to_double(ans$TTL));
     dns_cache[uid]$response_code = msg$rcode;
     }
 
@@ -1005,7 +1005,7 @@ event dns_NS_reply(c: connection, msg: dns_msg, ans: dns_answer, name: string)
     {
     local uid = c$uid;
     if ( uid !in dns_cache ) dns_cache[uid] = DNS_Features();
-    dns_cache[uid]$ttl_answer    = ans$TTL;
+    dns_cache[uid]$ttl_answer    = double_to_count(interval_to_double(ans$TTL));
     dns_cache[uid]$response_code = msg$rcode;
     }
 
@@ -1013,7 +1013,7 @@ event dns_CNAME_reply(c: connection, msg: dns_msg, ans: dns_answer, name: string
     {
     local uid = c$uid;
     if ( uid !in dns_cache ) dns_cache[uid] = DNS_Features();
-    dns_cache[uid]$ttl_answer    = ans$TTL;
+    dns_cache[uid]$ttl_answer    = double_to_count(interval_to_double(ans$TTL));
     dns_cache[uid]$response_code = msg$rcode;
     }
 
@@ -1170,13 +1170,13 @@ event connection_state_remove(c: connection) &priority=-5
         local total_fwd_bulk_bytes:  double = 0.0;
         local total_fwd_bulk_pkts:   double = 0.0;
         local total_fwd_bulk_dur:    double = 0.0;
-        local i = 0;
-        while ( i < |bulk_fwd_results[uid]| )
+        local fi = 0;
+        while ( fi < |bulk_fwd_results[uid]| )
             {
-            total_fwd_bulk_bytes += bulk_fwd_results[uid][i];
-            total_fwd_bulk_pkts  += bulk_fwd_results[uid][i+1];
-            total_fwd_bulk_dur   += bulk_fwd_results[uid][i+2];
-            i += 3;
+            total_fwd_bulk_bytes += bulk_fwd_results[uid][fi];
+            total_fwd_bulk_pkts  += bulk_fwd_results[uid][fi+1];
+            total_fwd_bulk_dur   += bulk_fwd_results[uid][fi+2];
+            fi += 3;
             }
         fwd_bulk_byte_avg = total_fwd_bulk_bytes / n_fwd_bulk;
         fwd_bulk_pkt_avg  = total_fwd_bulk_pkts  / n_fwd_bulk;
@@ -1278,8 +1278,8 @@ event connection_state_remove(c: connection) &priority=-5
         icmp_ipv4_type = icmp_cache[uid]$icmp_ipv4_type;
         }
     # For ICMP flows, Zeek encodes type in id.orig_p
-    else if ( c$conn?$proto && c$conn$proto == icmp )
-        icmp_type = c$id$orig_p;
+    else if ( c$conn?$proto && c$conn$proto == "icmp" )
+        icmp_type = count_of(c$id$orig_p);
 
     # ── Min/Max TTL safety check (if no IP packets seen, reset to 0) ─────────
     local min_ttl_val: count = 0;
