@@ -23,7 +23,7 @@
 ##!   - context$proto                 — icmp_context has no $ip or $ip_hdr
 ##!   - port_to_count()               — count_of() does not exist
 ##!   - double_to_count(interval_to_double(ans$TTL)) — TTL is interval not count
-##!   - c$conn$proto == "icmp"        — proto is string, not identifier
+##!   - c$conn$proto == icmp          — proto is transport_proto enum, not string
 ##!   - distinct loop variable names  — no duplicate local declarations
 ##! =============================================================================
 
@@ -687,7 +687,7 @@ event connection_state_remove(c: connection) &priority=-5
     local proto_num: count = 0;
     if ( c$conn?$proto )
         {
-        local proto_str = c$conn$proto;
+        local proto_str: string = fmt("%s", c$conn$proto);
         if ( proto_str in proto_num_map )
             proto_num = proto_num_map[proto_str];
         }
@@ -768,7 +768,7 @@ event connection_state_remove(c: connection) &priority=-5
     #      Zeek encodes ICMP type in id.orig_p (type port).
     #      FIX: use port_to_count() — count_of() does not exist.
     #      FIX: c$conn$proto is string — compare with "icmp" not bare icmp.
-    else if ( c$conn?$proto && c$conn$proto == "icmp" )
+    else if ( c$conn?$proto && c$conn$proto == icmp )
         icmp_t = port_to_count(c$id$orig_p);
 
     # ── DNS fields ─────────────────────────────────────────────────────────────
