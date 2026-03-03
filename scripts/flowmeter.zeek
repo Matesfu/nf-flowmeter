@@ -927,9 +927,9 @@ event icmp_unreachable(c: connection, icmp: icmp_info,
     if ( uid !in icmp_cache )
         icmp_cache[uid] = ICMP_Features();
     icmp_cache[uid]$icmp_type = 3;  # ICMP type 3 = Destination Unreachable
-    # context$ip holds the original IP header that triggered the ICMP error
-    if ( context?$ip_hdr )
-        icmp_cache[uid]$icmp_ipv4_type = context$ip_hdr$p;
+    # context$proto holds the inner packet's transport protocol number
+    if ( context$proto > 0 )
+        icmp_cache[uid]$icmp_ipv4_type = context$proto;
     }
 
 event icmp_time_exceeded(c: connection, icmp: icmp_info,
@@ -939,8 +939,8 @@ event icmp_time_exceeded(c: connection, icmp: icmp_info,
     if ( uid !in icmp_cache )
         icmp_cache[uid] = ICMP_Features();
     icmp_cache[uid]$icmp_type = 11;  # ICMP type 11 = Time Exceeded
-    if ( context?$ip_hdr )
-        icmp_cache[uid]$icmp_ipv4_type = context$ip_hdr$p;
+    if ( context$proto > 0 )
+        icmp_cache[uid]$icmp_ipv4_type = context$proto;
     }
 
 event icmp_echo_request(c: connection, icmp: icmp_info,
@@ -1279,7 +1279,7 @@ event connection_state_remove(c: connection) &priority=-5
         }
     # For ICMP flows, Zeek encodes type in id.orig_p
     else if ( c$conn?$proto && c$conn$proto == "icmp" )
-        icmp_type = count_of(c$id$orig_p);
+        icmp_type = port_to_count(c$id$orig_p);
 
     # ── Min/Max TTL safety check (if no IP packets seen, reset to 0) ─────────
     local min_ttl_val: count = 0;
