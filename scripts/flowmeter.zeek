@@ -14,11 +14,8 @@
 ##! Usage (PCAP mode — works on WSL):
 ##!   zeek -C -r your_traffic.pcap flowmeter
 ##!
-##! L7_PROTO is emitted as a numeric nDPI protocol ID, matching the values
-##! used by nProbe and the NF-v3 dataset.  Zeek service strings are mapped to
-##! nDPI integers via a lookup table sourced from
-##!   https://github.com/ntop/nDPI/blob/dev/src/include/ndpi_protocol_ids.h
-##! Unknown or unmapped services resolve to 0 (NDPI_PROTOCOL_UNKNOWN).
+##! L7_PROTO is emitted as the Zeek service string in uppercase (e.g. "HTTP",
+##! "DNS", "SSL", "FTP").  If no service is detected the field is empty ("").
 ##! =============================================================================
 
 module FlowMeter;
@@ -118,8 +115,8 @@ export {
         # 39: FTP ───────────────────────────────────────────────────────────
         FTP_COMMAND_RET_CODE: count &log &default=0;
 
-        # 40: L7 protocol (nDPI numeric ID; 0 = unknown) ───────────────────
-        L7_PROTO:           count   &log &default=0;
+        # 40: L7 protocol (Zeek service string, uppercased; "" = unknown) ────
+        L7_PROTO:           string  &log &default="";
 
         # 41–43: HTTP ───────────────────────────────────────────────────────
         HTTP_URL:           string  &log &default="";
@@ -198,76 +195,6 @@ global http_cache:          table[string] of HTTP_Features;
 global ftp_cache:           table[string] of FTP_Features;
 global icmp_cache:          table[string] of ICMP_Features;
 
-# =============================================================================
-# Zeek service → nDPI protocol ID mapping
-# =============================================================================
-#
-# Values sourced directly from the authoritative nDPI enum:
-#   https://github.com/ntop/nDPI/blob/dev/src/include/ndpi_protocol_ids.h
-#
-# Every key is a Zeek service string as it appears in c$conn$service (i.e.
-# the lower-cased analyzer tag name).  Keys not present map to 0 (UNKNOWN).
-#
-# Each nDPI ID is used at most once — no duplicates.  Where Zeek has multiple
-# transport variants of the same analyzer (e.g. dnp3_tcp / dnp3_udp), both map
-# to the single nDPI protocol number.
-const zeek_to_ndpi: table[string] of count = {
-    # ── Core application protocols ────────────────────────────────────────
-    ["http"]        = 7,     # NDPI_PROTOCOL_HTTP
-    ["dns"]         = 5,     # NDPI_PROTOCOL_DNS
-    ["ssh"]         = 92,    # NDPI_PROTOCOL_SSH
-    ["ssl"]         = 91,    # NDPI_PROTOCOL_TLS
-    ["ftp"]         = 1,     # NDPI_PROTOCOL_FTP_CONTROL
-    ["ftp-data"]    = 175,   # NDPI_PROTOCOL_FTP_DATA (Zeek uses hyphen)
-    ["ftp_data"]    = 175,   # NDPI_PROTOCOL_FTP_DATA (analyzer name)
-    ["smtp"]        = 3,     # NDPI_PROTOCOL_MAIL_SMTP
-    ["pop3"]        = 2,     # NDPI_PROTOCOL_MAIL_POP
-    ["imap"]        = 4,     # NDPI_PROTOCOL_MAIL_IMAP
-
-    # ── Infrastructure ────────────────────────────────────────────────────
-    ["ntp"]         = 9,     # NDPI_PROTOCOL_NTP
-    ["snmp"]        = 14,    # NDPI_PROTOCOL_SNMP
-    ["dhcp"]        = 18,    # NDPI_PROTOCOL_DHCP
-    ["syslog"]      = 17,    # NDPI_PROTOCOL_SYSLOG
-    ["radius"]      = 146,   # NDPI_PROTOCOL_RADIUS
-    ["ldap_tcp"]    = 112,   # NDPI_PROTOCOL_LDAP
-    ["ldap_udp"]    = 112,   # NDPI_PROTOCOL_LDAP
-    ["krb"]         = 111,   # NDPI_PROTOCOL_KERBEROS
-    ["krb_tcp"]     = 111,   # NDPI_PROTOCOL_KERBEROS
-    ["gssapi"]      = 111,   # NDPI_PROTOCOL_KERBEROS (GSSAPI wraps Kerberos)
-    ["tftp"]        = 96,    # NDPI_PROTOCOL_TFTP
-
-    # ── Remote access / management ────────────────────────────────────────
-    ["telnet"]      = 77,    # NDPI_PROTOCOL_TELNET
-    ["rdp"]         = 88,    # NDPI_PROTOCOL_RDP
-    ["rfb"]         = 89,    # NDPI_PROTOCOL_VNC (RFB is VNC's wire protocol)
-    ["socks"]       = 172,   # NDPI_PROTOCOL_SOCKS
-
-    # ── VoIP / messaging ──────────────────────────────────────────────────
-    ["sip"]         = 100,   # NDPI_PROTOCOL_SIP
-    ["xmpp"]        = 67,    # NDPI_PROTOCOL_JABBER (XMPP = Jabber)
-    ["irc"]         = 65,    # NDPI_PROTOCOL_IRC
-
-    # ── Databases ─────────────────────────────────────────────────────────
-    ["mysql"]       = 20,    # NDPI_PROTOCOL_MYSQL
-    ["postgresql"]  = 19,    # NDPI_PROTOCOL_POSTGRES
-    ["redis"]       = 182,   # NDPI_PROTOCOL_RESP (REdis Serialization Proto)
-
-    # ── File sharing / enterprise ─────────────────────────────────────────
-    ["smb"]         = 41,    # NDPI_PROTOCOL_SMBV23
-    ["nfs"]         = 11,    # NDPI_PROTOCOL_NFS
-    ["dce_rpc"]     = 127,   # NDPI_PROTOCOL_MS_RPCH
-
-    # ── Industrial / IoT ──────────────────────────────────────────────────
-    ["modbus"]      = 44,    # NDPI_PROTOCOL_MODBUS
-    ["dnp3_tcp"]    = 244,   # NDPI_PROTOCOL_DNP3
-    ["dnp3_udp"]    = 244,   # NDPI_PROTOCOL_DNP3
-    ["mqtt"]        = 222,   # NDPI_PROTOCOL_MQTT
-
-    # ── Modern web / transport ────────────────────────────────────────────
-    ["quic"]        = 188,   # NDPI_PROTOCOL_QUIC
-    ["websocket"]   = 251,   # NDPI_PROTOCOL_WEBSOCKET
-} &redef;
 
 # =============================================================================
 # Helper functions
@@ -285,24 +212,21 @@ function proto_to_num(p: transport_proto): count
     return 0;
     }
 
-## Map Zeek's service string (from c$conn$service) to an nDPI numeric ID.
+## Return the Zeek service string uppercased for L7_PROTO.
 ## When Zeek detects multiple services on one connection, c$conn$service
 ## is a comma-joined list (e.g. "ssl,http"); take the first one listed.
-## Returns 0 (NDPI_PROTOCOL_UNKNOWN) for empty or unmapped services.
-function service_to_ndpi(svc: string): count
+## Returns "" for empty or unknown services.
+function service_to_l7(svc: string): string
     {
     if ( svc == "" )
-        return 0;
+        return "";
 
     # Take first service if comma-separated
     local first = svc;
     if ( "," in svc )
         first = split_string1(svc, /,/)[0];
 
-    if ( first in zeek_to_ndpi )
-        return zeek_to_ndpi[first];
-
-    return 0;
+    return to_upper(first);
     }
 
 ## Compute min / max / avg / population-stddev over a vector of doubles.
@@ -440,9 +364,11 @@ event new_packet(c: connection, p: pkt_hdr) &priority=5
     local ts = network_time();
 
     # Direction: originator → responder is "fwd" (src→dst in NF-v3 terms)
-    local is_orig = (p?$ip &&
-                     p$ip$src == c$id$orig_h &&
-                     p$ip$dst == c$id$resp_h);
+    local is_orig = F;
+    if ( p?$ip )
+        is_orig = (p$ip$src == c$id$orig_h && p$ip$dst == c$id$resp_h);
+    else if ( p?$ip6 )
+        is_orig = (p$ip6$src == c$id$orig_h);
 
     # ── Packet counts ────────────────────────────────────────────────────────
     if ( is_orig )
@@ -464,6 +390,20 @@ event new_packet(c: connection, p: pkt_hdr) &priority=5
         local ttl = p$ip$ttl;
         if ( ttl < ttl_min[uid] ) ttl_min[uid] = ttl;
         if ( ttl > ttl_max[uid] ) ttl_max[uid] = ttl;
+        }
+    else if ( p?$ip6 )
+        {
+        # IPv6: payload length field + 40-byte fixed header = full packet length
+        full_pkt_len = p$ip6$len + 40;
+        if ( full_pkt_len < ip_pkt_len_min[uid] )
+            ip_pkt_len_min[uid] = full_pkt_len;
+        if ( full_pkt_len > ip_pkt_len_max[uid] )
+            ip_pkt_len_max[uid] = full_pkt_len;
+
+        # ── TTL extremes (hop limit in IPv6) ─────────────────────────────────
+        local ttl6 = p$ip6$hlim;
+        if ( ttl6 < ttl_min[uid] ) ttl_min[uid] = ttl6;
+        if ( ttl6 > ttl_max[uid] ) ttl_max[uid] = ttl6;
         }
 
     # ── Packet-size histogram bins ──────────────────────────────────────────
@@ -504,9 +444,11 @@ event new_packet(c: connection, p: pkt_hdr) &priority=5
     # ── Payload byte totals (for SRC_TO_DST / DST_TO_SRC SECOND_BYTES) ──────
     # Payload = full IP length − IP header − transport header
     # Note: p$ip$hl and p$tcp$hl are already in bytes in Zeek (not 4-byte words)
+    # For IPv6 the fixed header is always 40 bytes.
     local ip_hdr_len: count = 0;
     local xport_hdr_len: count = 0;
-    if ( p?$ip )   ip_hdr_len    = p$ip$hl;
+    if ( p?$ip )        ip_hdr_len    = p$ip$hl;
+    else if ( p?$ip6 )  ip_hdr_len    = 40;
     if ( p?$tcp )  xport_hdr_len = p$tcp$hl;
     else if ( p?$udp )  xport_hdr_len = 8;
     else if ( p?$icmp ) xport_hdr_len = 8;
@@ -817,10 +759,10 @@ event connection_state_remove(c: connection) &priority=-5
     local start_ms = time_to_double(flow_start_time[uid]) * 1000.0;
     local end_ms   = start_ms + dur_ms;
 
-    # ── L7 protocol (nDPI numeric ID from Zeek service string) ───────────────
-    local l7: count = 0;
+    # ── L7 protocol (Zeek service string, uppercased) ────────────────────────
+    local l7: string = "";
     if ( c?$conn && c$conn?$service )
-        l7 = service_to_ndpi(c$conn$service);
+        l7 = service_to_l7(c$conn$service);
 
     # ── Application-layer features ───────────────────────────────────────────
     local dns_qid:   count = 0;
