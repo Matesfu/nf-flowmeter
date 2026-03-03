@@ -1,0 +1,4 @@
+[package]
+script_dir = scripts
+description = Extended zeek-flowmeter with NF-CSE-CIC-IDS2018-v3 NetFlow v9 feature parity for IDS/IPS model inference. Adds TTL, retransmission, packet size histograms, TCP window max, TCP flag bitmasks, per-direction throughput, ICMP, DNS, FTP, and HTTP application-layer features.
+tags = zeek, flowmeter, netflow, ids, ips, machine-learning, feature-extraction, nf-cse-cic-ids2018
