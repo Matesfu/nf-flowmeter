@@ -147,10 +147,6 @@ export {
 global pkt_count_fwd:       table[string] of count;
 global pkt_count_bwd:       table[string] of count;
 
-# Payload byte totals per direction (for SECOND_BYTES throughput)
-global payload_bytes_fwd:   table[string] of count;
-global payload_bytes_bwd:   table[string] of count;
-
 # IP packet length extremes (full packet including headers)
 global ip_pkt_len_min:      table[string] of count;
 global ip_pkt_len_max:      table[string] of count;
@@ -180,11 +176,21 @@ global retrans_in_bytes:    table[string] of count;
 global retrans_out_pkts:    table[string] of count;
 global retrans_out_bytes:   table[string] of count;
 
-# IAT tracking — packet arrival times & accumulated gaps per direction
+# IAT tracking — last packet time per direction (for gap computation)
 global last_pkt_time_fwd:   table[string] of time;
 global last_pkt_time_bwd:   table[string] of time;
-global iat_fwd:             table[string] of vector of double;
-global iat_bwd:             table[string] of vector of double;
+# IAT running accumulators — O(1) memory regardless of flow length
+# (replaces unbounded vectors; units are microseconds per NF-v3 spec)
+global iat_fwd_min:         table[string] of double;
+global iat_fwd_max:         table[string] of double;
+global iat_fwd_sum:         table[string] of double;
+global iat_fwd_sum2:        table[string] of double;
+global iat_fwd_n:           table[string] of count;
+global iat_bwd_min:         table[string] of double;
+global iat_bwd_max:         table[string] of double;
+global iat_bwd_sum:         table[string] of double;
+global iat_bwd_sum2:        table[string] of double;
+global iat_bwd_n:           table[string] of count;
 
 # Flow start timestamp
 global flow_start_time:     table[string] of time;
@@ -229,43 +235,11 @@ function service_to_l7(svc: string): string
     return to_upper(first);
     }
 
-## Compute min / max / avg / population-stddev over a vector of doubles.
-## Returns a 4-element vector: [min, max, avg, stddev].
-function iat_stats(v: vector of double): vector of double
-    {
-    if ( |v| == 0 )
-        return vector(0.0, 0.0, 0.0, 0.0);
-
-    local vmin = v[0];
-    local vmax = v[0];
-    local sum  = 0.0;
-    for ( i in v )
-        {
-        local x = v[i];
-        sum += x;
-        if ( x < vmin ) vmin = x;
-        if ( x > vmax ) vmax = x;
-        }
-    local avg = sum / |v|;
-
-    local var = 0.0;
-    for ( j in v )
-        {
-        local d = v[j] - avg;
-        var += d * d;
-        }
-    local std = sqrt(var / |v|);
-
-    return vector(vmin, vmax, avg, std);
-    }
-
 ## Initialise all per-flow state when a new connection is first seen.
 function init_flow(uid: string, ts: time)
     {
     pkt_count_fwd[uid]     = 0;
     pkt_count_bwd[uid]     = 0;
-    payload_bytes_fwd[uid] = 0;
-    payload_bytes_bwd[uid] = 0;
     ip_pkt_len_min[uid]    = 65535;
     ip_pkt_len_max[uid]    = 0;
     ttl_min[uid]           = 255;
@@ -283,8 +257,16 @@ function init_flow(uid: string, ts: time)
     retrans_in_bytes[uid]  = 0;
     retrans_out_pkts[uid]  = 0;
     retrans_out_bytes[uid] = 0;
-    iat_fwd[uid]           = vector();
-    iat_bwd[uid]           = vector();
+    iat_fwd_min[uid]       = 1e300;
+    iat_fwd_max[uid]       = 0.0;
+    iat_fwd_sum[uid]       = 0.0;
+    iat_fwd_sum2[uid]      = 0.0;
+    iat_fwd_n[uid]         = 0;
+    iat_bwd_min[uid]       = 1e300;
+    iat_bwd_max[uid]       = 0.0;
+    iat_bwd_sum[uid]       = 0.0;
+    iat_bwd_sum2[uid]      = 0.0;
+    iat_bwd_n[uid]         = 0;
     flow_start_time[uid]   = ts;
     }
 
@@ -293,8 +275,6 @@ function cleanup_flow(uid: string)
     {
     delete pkt_count_fwd[uid];
     delete pkt_count_bwd[uid];
-    delete payload_bytes_fwd[uid];
-    delete payload_bytes_bwd[uid];
     delete ip_pkt_len_min[uid];
     delete ip_pkt_len_max[uid];
     delete ttl_min[uid];
@@ -312,8 +292,16 @@ function cleanup_flow(uid: string)
     delete retrans_in_bytes[uid];
     delete retrans_out_pkts[uid];
     delete retrans_out_bytes[uid];
-    delete iat_fwd[uid];
-    delete iat_bwd[uid];
+    delete iat_fwd_min[uid];
+    delete iat_fwd_max[uid];
+    delete iat_fwd_sum[uid];
+    delete iat_fwd_sum2[uid];
+    delete iat_fwd_n[uid];
+    delete iat_bwd_min[uid];
+    delete iat_bwd_max[uid];
+    delete iat_bwd_sum[uid];
+    delete iat_bwd_sum2[uid];
+    delete iat_bwd_n[uid];
     delete flow_start_time[uid];
     if ( uid in last_pkt_time_fwd ) delete last_pkt_time_fwd[uid];
     if ( uid in last_pkt_time_bwd ) delete last_pkt_time_bwd[uid];
@@ -335,12 +323,17 @@ event zeek_init() &priority=5
 
 event zeek_init() &priority=-5
     {
-    # Configure the flowmeter.log writer to emit JSON so every field name
-    # appears alongside its value on every line.  This only affects the
-    # flowmeter stream — other Zeek logs keep their normal format.
-    local f = Log::get_filter(FlowMeter::LOG, "default");
-    f$config = table(["use_json"] = "T");
-    Log::add_filter(FlowMeter::LOG, f);
+    # Bug 6 fix: Log::get_filter returns a copy in Zeek 8.x — modifying
+    # it and calling add_filter may be silently ignored.  Instead,
+    # remove the default filter and add a fully specified replacement
+    # that is guaranteed to use the JSON writer.
+    Log::remove_filter(FlowMeter::LOG, "default");
+    Log::add_filter(FlowMeter::LOG, Log::Filter(
+        $name      = "default",
+        $path      = "flowmeter",
+        $writer    = Log::WRITER_ASCII,
+        $config    = table(["use_json"] = "T")
+    ));
     }
 
 # =============================================================================
@@ -441,39 +434,33 @@ event new_packet(c: connection, p: pkt_hdr) &priority=5
             }
         }
 
-    # ── Payload byte totals (for SRC_TO_DST / DST_TO_SRC SECOND_BYTES) ──────
-    # Payload = full IP length − IP header − transport header
-    # Note: p$ip$hl and p$tcp$hl are already in bytes in Zeek (not 4-byte words)
-    # For IPv6 the fixed header is always 40 bytes.
-    local ip_hdr_len: count = 0;
-    local xport_hdr_len: count = 0;
-    if ( p?$ip )        ip_hdr_len    = p$ip$hl;
-    else if ( p?$ip6 )  ip_hdr_len    = 40;
-    if ( p?$tcp )  xport_hdr_len = p$tcp$hl;
-    else if ( p?$udp )  xport_hdr_len = 8;
-    else if ( p?$icmp ) xport_hdr_len = 8;
-
-    local hdr_total = ip_hdr_len + xport_hdr_len;
-    local payload_len: count = 0;
-    if ( full_pkt_len > hdr_total )
-        payload_len = full_pkt_len - hdr_total;
-
-    if ( is_orig )
-        payload_bytes_fwd[uid] += payload_len;
-    else
-        payload_bytes_bwd[uid] += payload_len;
-
-    # ── Inter-arrival time per direction ─────────────────────────────────────
+    # ── Inter-arrival time per direction (microseconds, NF-v3 spec) ─────────
+    # Running accumulators replace unbounded vectors — O(1) memory per flow.
+    # Bug 2 fix: multiply by 1e6 to convert seconds → microseconds.
     if ( is_orig )
         {
         if ( uid in last_pkt_time_fwd )
-            iat_fwd[uid] += interval_to_double(ts - last_pkt_time_fwd[uid]);
+            {
+            local gap_f = interval_to_double(ts - last_pkt_time_fwd[uid]) * 1e6;
+            if ( gap_f < iat_fwd_min[uid] ) iat_fwd_min[uid] = gap_f;
+            if ( gap_f > iat_fwd_max[uid] ) iat_fwd_max[uid] = gap_f;
+            iat_fwd_sum[uid]  += gap_f;
+            iat_fwd_sum2[uid] += gap_f * gap_f;
+            iat_fwd_n[uid]    += 1;
+            }
         last_pkt_time_fwd[uid] = ts;
         }
     else
         {
         if ( uid in last_pkt_time_bwd )
-            iat_bwd[uid] += interval_to_double(ts - last_pkt_time_bwd[uid]);
+            {
+            local gap_b = interval_to_double(ts - last_pkt_time_bwd[uid]) * 1e6;
+            if ( gap_b < iat_bwd_min[uid] ) iat_bwd_min[uid] = gap_b;
+            if ( gap_b > iat_bwd_max[uid] ) iat_bwd_max[uid] = gap_b;
+            iat_bwd_sum[uid]  += gap_b;
+            iat_bwd_sum2[uid] += gap_b * gap_b;
+            iat_bwd_n[uid]    += 1;
+            }
         last_pkt_time_bwd[uid] = ts;
         }
     }
@@ -685,7 +672,21 @@ event connection_state_remove(c: connection) &priority=-5
     local src_port = port_to_count(c$id$orig_p);
     local dst_addr = c$id$resp_h;
     local dst_port = port_to_count(c$id$resp_p);
-    local proto_num = proto_to_num(get_port_transport_proto(c$id$resp_p));
+    # Bug 4 fix: Zeek transport_proto has no icmp6 enum value.
+    # Distinguish ICMPv4 (1) from ICMPv6 (58) by address family.
+    local proto_num: count = 0;
+    local _tp = get_port_transport_proto(c$id$resp_p);
+    if ( _tp == tcp )
+        proto_num = 6;
+    else if ( _tp == udp )
+        proto_num = 17;
+    else if ( _tp == icmp )
+        {
+        if ( is_v6_addr(c$id$orig_h) )
+            proto_num = 58;   # ICMPv6
+        else
+            proto_num = 1;    # ICMPv4
+        }
 
     # ── Duration (milliseconds) ──────────────────────────────────────────────
     local dur_sec: double = 0.0;
@@ -702,25 +703,20 @@ event connection_state_remove(c: connection) &priority=-5
         if ( c$conn?$resp_ip_bytes ) out_bytes = c$conn$resp_ip_bytes;
         }
 
-    # ── Per-direction throughput ─────────────────────────────────────────────
-    # These two metrics are intentionally DISTINCT (nProbe semantics):
-    #   SRC_TO_DST_SECOND_BYTES   = L4 payload bytes/sec (excludes IP+transport hdrs)
-    #                               Numerator = sum of per-packet payload lengths
-    #                               tracked in payload_bytes_fwd during new_packet().
-    #   SRC_TO_DST_AVG_THROUGHPUT = full IP-level bytes/sec (includes all headers)
-    #                               Numerator = c$conn$orig_ip_bytes from Zeek's
-    #                               connection accounting (same as IN_BYTES).
-    # Zero-duration flows keep both at 0.0 (guard below).
+    # ── Per-direction throughput (both use IP-level bytes per NF-v3 spec) ────
+    # Bug 3 fix: SECOND_BYTES now uses IP-level bytes (in_bytes / out_bytes),
+    # matching nProbe's NetFlow v9 export and the NF-v3 training data.
+    # Zero-duration flows keep all four values at 0.0.
     local s2d_sec_bytes: double = 0.0;
     local d2s_sec_bytes: double = 0.0;
     local s2d_avg_tput:  double = 0.0;
     local d2s_avg_tput:  double = 0.0;
     if ( dur_sec > 0.0 )
         {
-        s2d_sec_bytes = payload_bytes_fwd[uid] / dur_sec;   # L4 payload only
-        d2s_sec_bytes = payload_bytes_bwd[uid] / dur_sec;   # L4 payload only
-        s2d_avg_tput  = in_bytes  / dur_sec;                # IP-level (w/ headers)
-        d2s_avg_tput  = out_bytes / dur_sec;                # IP-level (w/ headers)
+        s2d_sec_bytes = in_bytes  / dur_sec;   # IP-level bytes/sec
+        d2s_sec_bytes = out_bytes / dur_sec;   # IP-level bytes/sec
+        s2d_avg_tput  = in_bytes  / dur_sec;   # IP-level avg throughput
+        d2s_avg_tput  = out_bytes / dur_sec;   # IP-level avg throughput
         }
 
     # ── Sentinel handling for MIN_* fields ───────────────────────────────────
@@ -751,9 +747,34 @@ event connection_state_remove(c: connection) &priority=-5
         max_ip_len = ip_pkt_len_max[uid];
         }
 
-    # ── IAT statistics per direction ─────────────────────────────────────────
-    local fwd_iat = iat_stats(iat_fwd[uid]);   # [min, max, avg, stddev]
-    local bwd_iat = iat_stats(iat_bwd[uid]);
+    # ── IAT statistics per direction (from O(1) running accumulators) ────────
+    local fwd_iat_min_v:    double = 0.0;
+    local fwd_iat_max_v:    double = 0.0;
+    local fwd_iat_avg_v:    double = 0.0;
+    local fwd_iat_stddev_v: double = 0.0;
+    if ( iat_fwd_n[uid] > 0 )
+        {
+        fwd_iat_min_v = iat_fwd_min[uid];
+        fwd_iat_max_v = iat_fwd_max[uid];
+        fwd_iat_avg_v = iat_fwd_sum[uid] / iat_fwd_n[uid];
+        local fwd_var = ( iat_fwd_sum2[uid] / iat_fwd_n[uid] )
+                        - ( fwd_iat_avg_v * fwd_iat_avg_v );
+        if ( fwd_var > 0.0 ) fwd_iat_stddev_v = sqrt(fwd_var);
+        }
+
+    local bwd_iat_min_v:    double = 0.0;
+    local bwd_iat_max_v:    double = 0.0;
+    local bwd_iat_avg_v:    double = 0.0;
+    local bwd_iat_stddev_v: double = 0.0;
+    if ( iat_bwd_n[uid] > 0 )
+        {
+        bwd_iat_min_v = iat_bwd_min[uid];
+        bwd_iat_max_v = iat_bwd_max[uid];
+        bwd_iat_avg_v = iat_bwd_sum[uid] / iat_bwd_n[uid];
+        local bwd_var = ( iat_bwd_sum2[uid] / iat_bwd_n[uid] )
+                        - ( bwd_iat_avg_v * bwd_iat_avg_v );
+        if ( bwd_var > 0.0 ) bwd_iat_stddev_v = sqrt(bwd_var);
+        }
 
     # ── Flow timestamps (milliseconds since epoch) ───────────────────────────
     local start_ms = time_to_double(flow_start_time[uid]) * 1000.0;
@@ -869,14 +890,14 @@ event connection_state_remove(c: connection) &priority=-5
         $FLOW_START_MILLISECONDS     = start_ms,
         $FLOW_END_MILLISECONDS       = end_ms,
 
-        $SRC_TO_DST_IAT_MIN          = fwd_iat[0],
-        $SRC_TO_DST_IAT_MAX          = fwd_iat[1],
-        $SRC_TO_DST_IAT_AVG          = fwd_iat[2],
-        $SRC_TO_DST_IAT_STDDEV       = fwd_iat[3],
-        $DST_TO_SRC_IAT_MIN          = bwd_iat[0],
-        $DST_TO_SRC_IAT_MAX          = bwd_iat[1],
-        $DST_TO_SRC_IAT_AVG          = bwd_iat[2],
-        $DST_TO_SRC_IAT_STDDEV       = bwd_iat[3]
+        $SRC_TO_DST_IAT_MIN          = fwd_iat_min_v,
+        $SRC_TO_DST_IAT_MAX          = fwd_iat_max_v,
+        $SRC_TO_DST_IAT_AVG          = fwd_iat_avg_v,
+        $SRC_TO_DST_IAT_STDDEV       = fwd_iat_stddev_v,
+        $DST_TO_SRC_IAT_MIN          = bwd_iat_min_v,
+        $DST_TO_SRC_IAT_MAX          = bwd_iat_max_v,
+        $DST_TO_SRC_IAT_AVG          = bwd_iat_avg_v,
+        $DST_TO_SRC_IAT_STDDEV       = bwd_iat_stddev_v
     );
 
     Log::write(FlowMeter::LOG, rec);
